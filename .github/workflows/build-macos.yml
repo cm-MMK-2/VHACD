@@ -1,0 +1,170 @@
+name: Build VHACD Universal Binary
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Check project structure
+      run: |
+        echo "=== Project structure ==="
+        ls -la
+        echo "=== Source directory ==="
+        ls -la src/ || echo "No src directory"
+        echo "=== Looking for VHACD_Lib ==="
+        find . -name "VHACD_Lib" -type d
+        echo "=== Looking for cmake files ==="
+        find . -name "*.cmake"
+    
+    - name: Install dependencies
+      run: |
+        brew install cmake
+    
+    - name: Navigate to source directory
+      run: |
+        # VHACD的源码通常在src目录下
+        if [ -d "src" ]; then
+          cd src
+          echo "Found src directory"
+        else
+          echo "Building from root"
+        fi
+        pwd
+        ls -la
+    
+    - name: Create build directory and configure
+      run: |
+        # 检查是否需要进入src目录
+        if [ -d "src" ] && [ -f "src/CMakeLists.txt" ]; then
+          cd src
+          BUILD_DIR="../build"
+        else
+          BUILD_DIR="build"
+        fi
+        
+        mkdir -p $BUILD_DIR
+        cd $BUILD_DIR
+        
+        # 创建缺失的cmake_common.cmake文件（如果需要）
+        if [ ! -f "../scripts/cmake_common.cmake" ]; then
+          mkdir -p ../scripts
+          touch ../scripts/cmake_common.cmake
+        fi
+        
+        cmake .. \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+          -DNO_OPENCL=ON \
+          -DNO_OPENMP=OFF
+    
+    - name: Build VHACD
+      run: |
+        if [ -d "src" ] && [ -f "src/CMakeLists.txt" ]; then
+          cd build
+        else
+          cd build
+        fi
+        
+        cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+    
+    - name: Find and verify libraries
+      run: |
+        echo "=== Searching for all built files ==="
+        find . -name "*vhacd*" -type f 2>/dev/null || true
+        echo "=== Checking dynamic libraries ==="
+        find . -name "*.dylib" -exec file {} \; 2>/dev/null || true
+        find . -name "*.dylib" -exec lipo -info {} \; 2>/dev/null || true
+        echo "=== Checking static libraries ==="
+        find . -name "*.a" -exec file {} \; 2>/dev/null || true  
+        find . -name "*.a" -exec lipo -info {} \; 2>/dev/null || true
+    
+    - name: Package artifacts
+      run: |
+        mkdir -p artifacts
+        
+        # 复制库文件
+        find . -name "*vhacd*.dylib" -exec cp {} artifacts/ \; 2>/dev/null || true
+        find . -name "*vhacd*.a" -exec cp {} artifacts/ \; 2>/dev/null || true
+        
+        # 复制头文件
+        if [ -d "src/VHACD_Lib/inc" ]; then
+          mkdir -p artifacts/include
+          cp -r src/VHACD_Lib/inc/* artifacts/include/
+        elif [ -d "VHACD_Lib/inc" ]; then
+          mkdir -p artifacts/include  
+          cp -r VHACD_Lib/inc/* artifacts/include/
+        fi
+        
+        echo "=== Final artifacts ==="
+        ls -la artifacts/
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: vhacd-macos-universal
+        path: artifacts/
+        retention-days: 30
+
+  # 备用方案：强制构建shared库
+  build-shared-lib:
+    runs-on: macos-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Force build shared library
+      run: |
+        # 找到正确的源目录
+        if [ -d "src" ]; then
+          cd src
+        fi
+        
+        mkdir -p build-shared && cd build-shared
+        
+        # 创建cmake_common.cmake如果不存在
+        mkdir -p ../scripts
+        echo "# Dummy cmake common file" > ../scripts/cmake_common.cmake
+        
+        cmake .. \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
+          -DBUILD_SHARED_LIBS=ON \
+          -DNO_OPENCL=ON \
+          -DNO_OPENMP=OFF
+        
+        # 只构建VHACD_Lib目标
+        cmake --build . --target vhacd --config Release -j$(sysctl -n hw.ncpu)
+    
+    - name: Collect shared library
+      run: |
+        mkdir -p artifacts-shared
+        
+        if [ -d "src" ]; then
+          find src/build-shared -name "*.dylib" -exec cp {} artifacts-shared/ \; 2>/dev/null || true
+        else
+          find build-shared -name "*.dylib" -exec cp {} artifacts-shared/ \; 2>/dev/null || true
+        fi
+        
+        # 验证架构
+        find artifacts-shared -name "*.dylib" -exec lipo -info {} \;
+    
+    - name: Upload shared library
+      uses: actions/upload-artifact@v4
+      with:
+        name: vhacd-shared-macos-universal
+        path: artifacts-shared/
+        retention-days: 30

@@ -15,54 +15,58 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Debug - Show complete project structure
-      run: |
-        echo "=== Root directory ==="
-        ls -la
-        echo "=== Finding all CMakeLists.txt files ==="
-        find . -name "CMakeLists.txt" -type f
-        echo "=== Finding all directories ==="
-        find . -type d -maxdepth 3
-        echo "=== Contents of any src directory ==="
-        if [ -d "src" ]; then
-          ls -la src/
-        fi
-    
     - name: Install dependencies
       run: |
         brew install cmake
     
-    - name: Locate and build from correct directory
+    - name: Fix CMakeLists.txt version requirement
       run: |
-        # 寻找CMakeLists.txt文件
-        CMAKE_FILE=""
-        if [ -f "CMakeLists.txt" ]; then
-          CMAKE_FILE="."
-          echo "Found CMakeLists.txt in root"
-        elif [ -f "src/CMakeLists.txt" ]; then
-          CMAKE_FILE="src"
-          echo "Found CMakeLists.txt in src/"
-        else
-          echo "Error: Cannot find CMakeLists.txt"
-          exit 1
-        fi
+        cd src
+        # 备份原文件
+        cp CMakeLists.txt CMakeLists.txt.backup
         
-        echo "CMAKE_DIR=$CMAKE_FILE" >> $GITHUB_ENV
+        # 修改CMake版本要求从3.0.0改为3.5.0
+        sed -i '' 's/cmake_minimum_required(VERSION 3.0.0 FATAL_ERROR)/cmake_minimum_required(VERSION 3.5.0 FATAL_ERROR)/' CMakeLists.txt
         
-        # 进入正确的目录
-        cd $CMAKE_FILE
+        echo "=== Modified CMakeLists.txt ==="
+        head -5 CMakeLists.txt
+    
+    - name: Create missing cmake_common.cmake
+      run: |
+        cd src
+        mkdir -p ../scripts
+        cat > ../scripts/cmake_common.cmake << 'EOF'
+        # Auto-generated cmake_common.cmake for VHACD build
         
-        # 创建build目录
+        # Common settings
+        set(CMAKE_CXX_STANDARD 11)
+        set(CMAKE_CXX_STANDARD_REQUIRED ON)
+        
+        # Platform-specific settings
+        if(APPLE)
+            set(CMAKE_MACOSX_RPATH ON)
+        endif()
+        
+        # Collect source files for VHACD_Lib
+        file(GLOB_RECURSE PROJECT_CPP_FILES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+        file(GLOB_RECURSE PROJECT_C_FILES "${CMAKE_CURRENT_SOURCE_DIR}/*.c")
+        file(GLOB_RECURSE PROJECT_INC_FILES "${CMAKE_CURRENT_SOURCE_DIR}/inc/*.h")
+        file(GLOB_RECURSE PROJECT_INL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/inc/*.inl")
+        file(GLOB_RECURSE PROJECT_CL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/*.cl")
+        
+        # Add public headers too
+        file(GLOB_RECURSE PROJECT_PUB_FILES "${CMAKE_CURRENT_SOURCE_DIR}/public/*.h")
+        list(APPEND PROJECT_INC_FILES ${PROJECT_PUB_FILES})
+        EOF
+        
+        echo "Created cmake_common.cmake"
+    
+    - name: Configure CMake
+      run: |
+        cd src
         mkdir -p build
         cd build
         
-        # 如果需要创建cmake_common.cmake
-        if [ ! -f "../scripts/cmake_common.cmake" ]; then
-          mkdir -p ../scripts
-          echo "# Auto-generated cmake common file" > ../scripts/cmake_common.cmake
-        fi
-        
-        # 配置CMAKE
         cmake .. \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
@@ -71,52 +75,44 @@ jobs:
           -DNO_OPENCL=ON \
           -DNO_OPENMP=OFF
     
-    - name: Build project
+    - name: Build VHACD
       run: |
-        cd $CMAKE_DIR/build
+        cd src/build
         cmake --build . --config Release -j$(sysctl -n hw.ncpu)
     
-    - name: Find built libraries
+    - name: Find and verify libraries
       run: |
         echo "=== Searching for built libraries ==="
-        find . -name "*vhacd*" -type f 2>/dev/null || echo "No vhacd files found"
-        find . -name "*.dylib" 2>/dev/null || echo "No .dylib files found"  
-        find . -name "*.a" 2>/dev/null || echo "No .a files found"
+        find src/build -name "*vhacd*" -type f 2>/dev/null || echo "No vhacd files found"
+        find src/build -name "*.dylib" 2>/dev/null || echo "No .dylib files found"
+        find src/build -name "*.a" 2>/dev/null || echo "No .a files found"
         
         echo "=== Checking library architectures ==="
-        find . -name "*.dylib" -exec file {} \; 2>/dev/null || true
-        find . -name "*.dylib" -exec lipo -info {} \; 2>/dev/null || true
-        find . -name "*.a" -exec file {} \; 2>/dev/null || true
-        find . -name "*.a" -exec lipo -info {} \; 2>/dev/null || true
+        find src/build -name "*.dylib" -exec file {} \; 2>/dev/null || true
+        find src/build -name "*.dylib" -exec lipo -info {} \; 2>/dev/null || true
+        find src/build -name "*.a" -exec file {} \; 2>/dev/null || true
+        find src/build -name "*.a" -exec lipo -info {} \; 2>/dev/null || true
     
     - name: Package artifacts
       run: |
         mkdir -p artifacts
         
-        # 复制所有相关库文件
-        find . -name "*vhacd*" -name "*.dylib" -exec cp {} artifacts/ \; 2>/dev/null || true
-        find . -name "*vhacd*" -name "*.a" -exec cp {} artifacts/ \; 2>/dev/null || true
-        find . -name "libvhacd.*" -exec cp {} artifacts/ \; 2>/dev/null || true
+        # 复制库文件
+        find src/build -name "*vhacd*" -name "*.dylib" -exec cp {} artifacts/ \; 2>/dev/null || true
+        find src/build -name "*vhacd*" -name "*.a" -exec cp {} artifacts/ \; 2>/dev/null || true
+        find src/build -name "libvhacd.*" -exec cp {} artifacts/ \; 2>/dev/null || true
         
-        # 复制头文件 - 尝试多个可能的位置
-        HEADER_COPIED=false
-        for path in "src/VHACD_Lib/inc" "VHACD_Lib/inc" "src/VHACD_Lib/public" "VHACD_Lib/public" "include"; do
-          if [ -d "$path" ]; then
-            echo "Copying headers from $path"
-            mkdir -p artifacts/include
-            cp -r $path/* artifacts/include/ 2>/dev/null || true
-            HEADER_COPIED=true
-            break
-          fi
-        done
-        
-        if [ "$HEADER_COPIED" = false ]; then
-          echo "Warning: No header files found"
+        # 复制头文件
+        mkdir -p artifacts/include
+        if [ -d "src/VHACD_Lib/inc" ]; then
+          cp -r src/VHACD_Lib/inc/* artifacts/include/
+        fi
+        if [ -d "src/VHACD_Lib/public" ]; then
+          cp -r src/VHACD_Lib/public/* artifacts/include/
         fi
         
         echo "=== Final artifacts ==="
-        ls -la artifacts/ || echo "No artifacts created"
-        find artifacts -type f 2>/dev/null || echo "Artifacts directory is empty"
+        find artifacts -type f
     
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
@@ -124,55 +120,63 @@ jobs:
         name: vhacd-macos-universal
         path: artifacts/
         retention-days: 30
-      if: success() && hashFiles('artifacts/**') != ''
 
-  # 备用构建 - 尝试强制构建shared库
+  # 备用构建：尝试构建动态库
   build-shared:
     runs-on: macos-latest
-    needs: build-macos
-    if: always()
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Force shared library build
+    - name: Fix CMake version and build shared lib
       run: |
-        # 寻找CMakeLists.txt
-        if [ -f "src/CMakeLists.txt" ]; then
-          cd src
-        elif [ ! -f "CMakeLists.txt" ]; then
-          echo "Cannot find CMakeLists.txt anywhere"
-          exit 1
-        fi
+        cd src
+        
+        # 修改CMake版本
+        sed -i '' 's/cmake_minimum_required(VERSION 3.0.0 FATAL_ERROR)/cmake_minimum_required(VERSION 3.5.0 FATAL_ERROR)/' CMakeLists.txt
+        
+        # 创建cmake_common.cmake
+        mkdir -p ../scripts
+        cat > ../scripts/cmake_common.cmake << 'EOF'
+        file(GLOB_RECURSE PROJECT_CPP_FILES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+        file(GLOB_RECURSE PROJECT_C_FILES "${CMAKE_CURRENT_SOURCE_DIR}/*.c") 
+        file(GLOB_RECURSE PROJECT_INC_FILES "${CMAKE_CURRENT_SOURCE_DIR}/inc/*.h" "${CMAKE_CURRENT_SOURCE_DIR}/public/*.h")
+        file(GLOB_RECURSE PROJECT_INL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/inc/*.inl")
+        file(GLOB_RECURSE PROJECT_CL_FILES "${CMAKE_CURRENT_SOURCE_DIR}/*.cl")
+        EOF
         
         mkdir -p build-shared && cd build-shared
         
-        # 创建必要的文件
-        mkdir -p ../scripts
-        echo "# Dummy file" > ../scripts/cmake_common.cmake
-        
-        # 尝试不同的配置
         cmake .. \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
           -DBUILD_SHARED_LIBS=ON \
           -DNO_OPENCL=ON \
-          || echo "Standard cmake failed, trying alternative..."
+          -DNO_OPENMP=OFF
         
-        make -j$(sysctl -n hw.ncpu) || cmake --build . -j$(sysctl -n hw.ncpu)
+        cmake --build . --config Release -j$(sysctl -n hw.ncpu)
     
-    - name: Collect results
+    - name: Package shared library
       run: |
         mkdir -p artifacts-shared
-        find . -name "*.dylib" -exec cp {} artifacts-shared/ \; 2>/dev/null || echo "No dylib found"
-        find . -name "*.a" -exec cp {} artifacts-shared/ \; 2>/dev/null || echo "No static lib found"
-        ls -la artifacts-shared/ || echo "No shared artifacts"
+        find src/build-shared -name "*.dylib" -exec cp {} artifacts-shared/ \; 2>/dev/null || true
+        find src/build-shared -name "*.a" -exec cp {} artifacts-shared/ \; 2>/dev/null || true
+        
+        # 添加头文件
+        mkdir -p artifacts-shared/include
+        cp -r src/VHACD_Lib/inc/* artifacts-shared/include/ 2>/dev/null || true
+        cp -r src/VHACD_Lib/public/* artifacts-shared/include/ 2>/dev/null || true
+        
+        # 验证架构
+        find artifacts-shared -name "*.dylib" -exec lipo -info {} \; 2>/dev/null || true
+        
+        ls -la artifacts-shared/
     
-    - name: Upload shared artifacts
+    - name: Upload shared library
       uses: actions/upload-artifact@v4
       with:
-        name: vhacd-shared-macos
+        name: vhacd-shared-macos-universal
         path: artifacts-shared/
         retention-days: 30
-      if: hashFiles('artifacts-shared/**') != ''

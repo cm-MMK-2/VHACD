@@ -15,52 +15,54 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Check project structure
+    - name: Debug - Show complete project structure
       run: |
-        echo "=== Project structure ==="
+        echo "=== Root directory ==="
         ls -la
-        echo "=== Source directory ==="
-        ls -la src/ || echo "No src directory"
-        echo "=== Looking for VHACD_Lib ==="
-        find . -name "VHACD_Lib" -type d
-        echo "=== Looking for cmake files ==="
-        find . -name "*.cmake"
+        echo "=== Finding all CMakeLists.txt files ==="
+        find . -name "CMakeLists.txt" -type f
+        echo "=== Finding all directories ==="
+        find . -type d -maxdepth 3
+        echo "=== Contents of any src directory ==="
+        if [ -d "src" ]; then
+          ls -la src/
+        fi
     
     - name: Install dependencies
       run: |
         brew install cmake
     
-    - name: Navigate to source directory
+    - name: Locate and build from correct directory
       run: |
-        # VHACD的源码通常在src目录下
-        if [ -d "src" ]; then
-          cd src
-          echo "Found src directory"
+        # 寻找CMakeLists.txt文件
+        CMAKE_FILE=""
+        if [ -f "CMakeLists.txt" ]; then
+          CMAKE_FILE="."
+          echo "Found CMakeLists.txt in root"
+        elif [ -f "src/CMakeLists.txt" ]; then
+          CMAKE_FILE="src"
+          echo "Found CMakeLists.txt in src/"
         else
-          echo "Building from root"
-        fi
-        pwd
-        ls -la
-    
-    - name: Create build directory and configure
-      run: |
-        # 检查是否需要进入src目录
-        if [ -d "src" ] && [ -f "src/CMakeLists.txt" ]; then
-          cd src
-          BUILD_DIR="../build"
-        else
-          BUILD_DIR="build"
+          echo "Error: Cannot find CMakeLists.txt"
+          exit 1
         fi
         
-        mkdir -p $BUILD_DIR
-        cd $BUILD_DIR
+        echo "CMAKE_DIR=$CMAKE_FILE" >> $GITHUB_ENV
         
-        # 创建缺失的cmake_common.cmake文件（如果需要）
+        # 进入正确的目录
+        cd $CMAKE_FILE
+        
+        # 创建build目录
+        mkdir -p build
+        cd build
+        
+        # 如果需要创建cmake_common.cmake
         if [ ! -f "../scripts/cmake_common.cmake" ]; then
           mkdir -p ../scripts
-          touch ../scripts/cmake_common.cmake
+          echo "# Auto-generated cmake common file" > ../scripts/cmake_common.cmake
         fi
         
+        # 配置CMAKE
         cmake .. \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
@@ -69,46 +71,52 @@ jobs:
           -DNO_OPENCL=ON \
           -DNO_OPENMP=OFF
     
-    - name: Build VHACD
+    - name: Build project
       run: |
-        if [ -d "src" ] && [ -f "src/CMakeLists.txt" ]; then
-          cd build
-        else
-          cd build
-        fi
-        
+        cd $CMAKE_DIR/build
         cmake --build . --config Release -j$(sysctl -n hw.ncpu)
     
-    - name: Find and verify libraries
+    - name: Find built libraries
       run: |
-        echo "=== Searching for all built files ==="
-        find . -name "*vhacd*" -type f 2>/dev/null || true
-        echo "=== Checking dynamic libraries ==="
+        echo "=== Searching for built libraries ==="
+        find . -name "*vhacd*" -type f 2>/dev/null || echo "No vhacd files found"
+        find . -name "*.dylib" 2>/dev/null || echo "No .dylib files found"  
+        find . -name "*.a" 2>/dev/null || echo "No .a files found"
+        
+        echo "=== Checking library architectures ==="
         find . -name "*.dylib" -exec file {} \; 2>/dev/null || true
         find . -name "*.dylib" -exec lipo -info {} \; 2>/dev/null || true
-        echo "=== Checking static libraries ==="
-        find . -name "*.a" -exec file {} \; 2>/dev/null || true  
+        find . -name "*.a" -exec file {} \; 2>/dev/null || true
         find . -name "*.a" -exec lipo -info {} \; 2>/dev/null || true
     
     - name: Package artifacts
       run: |
         mkdir -p artifacts
         
-        # 复制库文件
-        find . -name "*vhacd*.dylib" -exec cp {} artifacts/ \; 2>/dev/null || true
-        find . -name "*vhacd*.a" -exec cp {} artifacts/ \; 2>/dev/null || true
+        # 复制所有相关库文件
+        find . -name "*vhacd*" -name "*.dylib" -exec cp {} artifacts/ \; 2>/dev/null || true
+        find . -name "*vhacd*" -name "*.a" -exec cp {} artifacts/ \; 2>/dev/null || true
+        find . -name "libvhacd.*" -exec cp {} artifacts/ \; 2>/dev/null || true
         
-        # 复制头文件
-        if [ -d "src/VHACD_Lib/inc" ]; then
-          mkdir -p artifacts/include
-          cp -r src/VHACD_Lib/inc/* artifacts/include/
-        elif [ -d "VHACD_Lib/inc" ]; then
-          mkdir -p artifacts/include  
-          cp -r VHACD_Lib/inc/* artifacts/include/
+        # 复制头文件 - 尝试多个可能的位置
+        HEADER_COPIED=false
+        for path in "src/VHACD_Lib/inc" "VHACD_Lib/inc" "src/VHACD_Lib/public" "VHACD_Lib/public" "include"; do
+          if [ -d "$path" ]; then
+            echo "Copying headers from $path"
+            mkdir -p artifacts/include
+            cp -r $path/* artifacts/include/ 2>/dev/null || true
+            HEADER_COPIED=true
+            break
+          fi
+        done
+        
+        if [ "$HEADER_COPIED" = false ]; then
+          echo "Warning: No header files found"
         fi
         
         echo "=== Final artifacts ==="
-        ls -la artifacts/
+        ls -la artifacts/ || echo "No artifacts created"
+        find artifacts -type f 2>/dev/null || echo "Artifacts directory is empty"
     
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
@@ -116,55 +124,55 @@ jobs:
         name: vhacd-macos-universal
         path: artifacts/
         retention-days: 30
+      if: success() && hashFiles('artifacts/**') != ''
 
-  # 备用方案：强制构建shared库
-  build-shared-lib:
+  # 备用构建 - 尝试强制构建shared库
+  build-shared:
     runs-on: macos-latest
+    needs: build-macos
+    if: always()
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
     
-    - name: Force build shared library
+    - name: Force shared library build
       run: |
-        # 找到正确的源目录
-        if [ -d "src" ]; then
+        # 寻找CMakeLists.txt
+        if [ -f "src/CMakeLists.txt" ]; then
           cd src
+        elif [ ! -f "CMakeLists.txt" ]; then
+          echo "Cannot find CMakeLists.txt anywhere"
+          exit 1
         fi
         
         mkdir -p build-shared && cd build-shared
         
-        # 创建cmake_common.cmake如果不存在
+        # 创建必要的文件
         mkdir -p ../scripts
-        echo "# Dummy cmake common file" > ../scripts/cmake_common.cmake
+        echo "# Dummy file" > ../scripts/cmake_common.cmake
         
+        # 尝试不同的配置
         cmake .. \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
-          -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
           -DBUILD_SHARED_LIBS=ON \
           -DNO_OPENCL=ON \
-          -DNO_OPENMP=OFF
+          || echo "Standard cmake failed, trying alternative..."
         
-        # 只构建VHACD_Lib目标
-        cmake --build . --target vhacd --config Release -j$(sysctl -n hw.ncpu)
+        make -j$(sysctl -n hw.ncpu) || cmake --build . -j$(sysctl -n hw.ncpu)
     
-    - name: Collect shared library
+    - name: Collect results
       run: |
         mkdir -p artifacts-shared
-        
-        if [ -d "src" ]; then
-          find src/build-shared -name "*.dylib" -exec cp {} artifacts-shared/ \; 2>/dev/null || true
-        else
-          find build-shared -name "*.dylib" -exec cp {} artifacts-shared/ \; 2>/dev/null || true
-        fi
-        
-        # 验证架构
-        find artifacts-shared -name "*.dylib" -exec lipo -info {} \;
+        find . -name "*.dylib" -exec cp {} artifacts-shared/ \; 2>/dev/null || echo "No dylib found"
+        find . -name "*.a" -exec cp {} artifacts-shared/ \; 2>/dev/null || echo "No static lib found"
+        ls -la artifacts-shared/ || echo "No shared artifacts"
     
-    - name: Upload shared library
+    - name: Upload shared artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: vhacd-shared-macos-universal
+        name: vhacd-shared-macos
         path: artifacts-shared/
         retention-days: 30
+      if: hashFiles('artifacts-shared/**') != ''
